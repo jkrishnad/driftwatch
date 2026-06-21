@@ -1,0 +1,17 @@
+[package]
+name = "driftwatch-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+driftwatch-common = { path = "../driftwatch-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "driftwatch"
+path = "src/main.rs"
