@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "driftwatch",
     "driftwatch-common",
-    "driftwatch-ebpf",
+    "driftwatch-ebpf", "xtask",
 ]
 default-members = ["driftwatch", "driftwatch-common"]
 

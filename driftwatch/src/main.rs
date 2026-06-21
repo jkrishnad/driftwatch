@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let program: &mut TracePoint = ebpf.program_mut("driftwatch").unwrap().try_into()?;
     program.load()?;
-    program.attach("block", "drift_watch")?;
+    program.attach("block", "block_rq_issue")?;
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
