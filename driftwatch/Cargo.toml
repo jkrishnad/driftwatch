@@ -11,15 +11,23 @@ driftwatch-common = { path = "../driftwatch-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+# rustls-tls (not default openssl) so the Lima VM build needs no libssl-dev.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde_json = "1"
 tokio = { workspace = true, features = [
     "macros",
     "rt",
     "rt-multi-thread",
     "net",
     "signal",
+    "time",
 ] }
 [build-dependencies]
 anyhow = { workspace = true }

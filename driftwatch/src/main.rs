@@ -1,12 +1,83 @@
+mod output;
+mod rpc;
+
+use std::time::Duration;
+
+use anyhow::Result;
 use aya::programs::TracePoint;
-#[rustfmt::skip]
+use clap::{Parser, Subcommand};
 use log::{debug, warn};
 use tokio::signal;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+#[derive(Parser)]
+#[command(
+    name = "driftwatch",
+    about = "eBPF disk profiler + validator RPC context"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Poll the validator's RPC and print a live status line. No eBPF.
+    Poll {
+        /// Validator JSON-RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        rpc: String,
+        /// Vote account pubkey to track (auto-discovered on test-validator).
+        #[arg(long)]
+        vote: Option<String>,
+        /// Seconds between polls.
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
+    /// Load the eBPF tracepoint profiler (block_rq_issue). Linux only, needs root.
+    Watch,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    match Cli::parse().cmd {
+        Cmd::Poll {
+            rpc,
+            vote,
+            interval,
+        } => poll(rpc, vote, interval).await,
+        Cmd::Watch => watch().await,
+    }
+}
+
+/// The RPC poll loop. Ask, print, repeat. Ctrl-C to stop.
+async fn poll(rpc_url: String, vote: Option<String>, interval: u64) -> Result<()> {
+    let mut poller = rpc::RpcPoller::new(&rpc_url);
+    if let Some(pk) = vote {
+        poller = poller.with_vote_pubkey(pk);
+    }
+
+    println!("driftwatch — polling {rpc_url} every {interval}s (Ctrl-C to stop)\n");
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Never fails: an unreachable RPC arrives as a DOWN sample,
+                // same stream as OK ones — outages are data, not stderr noise.
+                let sample = poller.sample().await;
+                println!("{}", output::status_line(&sample));
+            }
+            _ = signal::ctrl_c() => {
+                println!("\nstopping.");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Load + attach the eBPF tracepoint program, stream its logs.
+async fn watch() -> Result<()> {
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {

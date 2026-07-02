@@ -28,8 +28,13 @@ enum Cmd {
     Setup,
     /// rsync code to the VM and build it there (eBPF built automatically by build script).
     Build,
-    /// Sync + build + run the tracepoint program in the VM. Ctrl-C to stop.
-    Run,
+    /// Sync + build + run driftwatch in the VM. Ctrl-C to stop.
+    /// Args after `--` go to the binary, e.g: cargo xtask run -- poll
+    Run {
+        /// Arguments passed through to the driftwatch binary (default: watch).
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Run clippy in the VM.
     Check,
     /// Just push local code to the VM (no build).
@@ -46,18 +51,22 @@ fn main() -> Result<()> {
             sync()?;
             remote(&format!("cd {REMOTE_DIR} && cargo build --release"))?;
         }
-        Cmd::Run => {
+        Cmd::Run { args } => {
             sync()?;
+            let bin_args = if args.is_empty() {
+                "watch".to_string()
+            } else {
+                args.join(" ")
+            };
             // Clear stale tracepoint links from a previous unclean exit, then
-            // build and run. The program attaches itself to its tracepoint
-            // internally, so no interface argument is needed.
+            // build and run. sudo needed for `watch` (eBPF load); harmless for `poll`.
             remote(&format!(
                 "cd {REMOTE_DIR} && \
                  sudo bpftool link list 2>/dev/null \
                    | awk -F: '/tracepoint/{{print $1}}' \
                    | xargs -r -I{{}} sudo bpftool link detach id {{}} 2>/dev/null; \
                  cargo build --release -p driftwatch && \
-                 sudo RUST_LOG=info ./target/release/driftwatch"
+                 sudo RUST_LOG=info ./target/release/driftwatch {bin_args}"
             ))?;
         }
         Cmd::Check => {
