@@ -1,20 +1,145 @@
+// driftwatch kernel side: stamp / subtract / emit. All judging happens in the daemon.
+//
+// block_rq_issue    -> stash issue timestamp keyed by (dev, sector)
+// block_rq_complete -> lookup, latency = now - issue, push DiskEvent to ringbuf
+//
+// Field offsets come from /sys/kernel/tracing/events/block/*/format
+
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{macros::tracepoint, programs::TracePointContext};
-use aya_log_ebpf::info;
+use aya_ebpf::{
+    helpers::bpf_ktime_get_ns,
+    macros::{map, tracepoint},
+    maps::{LruHashMap, PerCpuArray, RingBuf},
+    programs::TracePointContext,
+};
+use driftwatch_common::{DiskEvent, DiskKey, RW_OTHER, RW_READ, RW_WRITE};
 
-#[tracepoint]
-pub fn driftwatch(ctx: TracePointContext) -> u32 {
-    match try_driftwatch(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+const DEV_OFF: usize = 8;
+const SECTOR_OFF: usize = 16;
+const NR_SECTOR_OFF: usize = 24;
+const ERROR_OFF: usize = 28; // complete only
+const RWBS_OFF: usize = 34;
+
+/// The stopwatch: in-flight requests, issue timestamp keyed by (dev, sector).
+/// LRU so orphaned entries (requeues/merges that never complete) self-evict
+/// instead of filling the map and silently killing inserts.
+#[map]
+static INFLIGHT: LruHashMap<DiskKey, u64> = LruHashMap::with_max_entries(10240, 0);
+
+/// The conveyor belt: completed-request events to the daemon.
+#[map]
+static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// The honesty counter: events lost because the ringbuf was full.
+#[map]
+static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Volume filter, set by the daemon before load (kernel dev_t of the ledger
+/// volume). 0 = accept all devices (dev/test mode).
+#[unsafe(no_mangle)]
+static TARGET_DEV: u32 = 0;
+
+#[inline(always)]
+fn target_dev() -> u32 {
+    // volatile: stop the compiler const-folding the pre-load placeholder value.
+    unsafe { core::ptr::read_volatile(&TARGET_DEV) }
 }
 
-fn try_driftwatch(ctx: TracePointContext) -> Result<u32, u32> {
-    info!(&ctx, "tracepoint drift_watch called");
-    Ok(0)
+#[tracepoint]
+pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
+    let _ = try_issue(&ctx);
+    0
+}
+
+fn try_issue(ctx: &TracePointContext) -> Result<(), i64> {
+    let dev: u32 = unsafe { ctx.read_at(DEV_OFF)? };
+    let target = target_dev();
+    if target != 0 && dev != target {
+        return Ok(()); // not the ledger volume — filter in-kernel, earliest exit
+    }
+    let sector: u64 = unsafe { ctx.read_at(SECTOR_OFF)? };
+    let key = DiskKey {
+        sector,
+        dev: dev as u64,
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    INFLIGHT.insert(&key, &now, 0)?;
+    Ok(())
+}
+
+#[tracepoint]
+pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
+    let _ = try_complete(&ctx);
+    0
+}
+
+fn try_complete(ctx: &TracePointContext) -> Result<(), i64> {
+    let dev: u32 = unsafe { ctx.read_at(DEV_OFF)? };
+    let target = target_dev();
+    if target != 0 && dev != target {
+        return Ok(());
+    }
+    let sector: u64 = unsafe { ctx.read_at(SECTOR_OFF)? };
+    let key = DiskKey {
+        sector,
+        dev: dev as u64,
+    };
+
+    // No stashed issue (loaded mid-flight, or LRU evicted it) — skip, don't guess.
+    let Some(issue_ns) = (unsafe { INFLIGHT.get(&key) }) else {
+        return Ok(());
+    };
+    let issue_ns = *issue_ns;
+    let _ = INFLIGHT.remove(&key);
+
+    let now = unsafe { bpf_ktime_get_ns() };
+    let nr_sector: u32 = unsafe { ctx.read_at(NR_SECTOR_OFF)? };
+    let error: i32 = unsafe { ctx.read_at(ERROR_OFF)? };
+
+    // rwbs is a flag string ("R", "WS", "FWS", ...). Op char isn't always first
+    // (preflush 'F' can lead), so scan for R/W.
+    let rwbs: [u8; 10] = unsafe { ctx.read_at(RWBS_OFF)? };
+    let mut rw = RW_OTHER;
+    for b in rwbs {
+        match b {
+            b'R' => {
+                rw = RW_READ;
+                break;
+            }
+            b'W' => {
+                rw = RW_WRITE;
+                break;
+            }
+            0 => break,
+            _ => {}
+        }
+    }
+
+    let event = DiskEvent {
+        sector,
+        latency_ns: now.saturating_sub(issue_ns),
+        dev,
+        bytes: nr_sector * 512,
+        error,
+        rw,
+        _pad: [0; 3],
+    };
+
+    match EVENTS.reserve::<DiskEvent>(0) {
+        Some(mut entry) => {
+            entry.write(event);
+            entry.submit(0);
+        }
+        None => {
+            // Ringbuf full: count the loss so the daemon knows its numbers lie.
+            if let Some(drops) = DROPS.get_ptr_mut(0) {
+                unsafe { *drops += 1 };
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]

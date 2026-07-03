@@ -1,3 +1,4 @@
+mod disk;
 mod output;
 mod rpc;
 
@@ -6,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use aya::programs::TracePoint;
 use clap::{Parser, Subcommand};
-use log::{debug, warn};
+use log::debug;
 use tokio::signal;
 
 #[derive(Parser)]
@@ -33,8 +34,14 @@ enum Cmd {
         #[arg(long, default_value_t = 2)]
         interval: u64,
     },
-    /// Load the eBPF tracepoint profiler (block_rq_issue). Linux only, needs root.
-    Watch,
+    /// Run the eBPF disk-latency profiler (block_rq_issue -> block_rq_complete).
+    /// Linux only, needs root.
+    Watch {
+        /// Only trace this block device, as "major:minor" (e.g. 259:0 — find
+        /// yours with `lsblk`). Default: all devices.
+        #[arg(long)]
+        dev: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -46,8 +53,20 @@ async fn main() -> Result<()> {
             vote,
             interval,
         } => poll(rpc, vote, interval).await,
-        Cmd::Watch => watch().await,
+        Cmd::Watch { dev } => watch(dev).await,
     }
+}
+
+/// "259:0" -> kernel dev_t encoding (major << 20 | minor), same as the
+/// tracepoint's dev field.
+fn parse_dev(s: &str) -> Result<u32> {
+    let (major, minor) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--dev wants major:minor, e.g. 259:0"))?;
+
+    let major: u32 = major.trim().parse()?;
+    let minor: u32 = minor.trim().parse()?;
+    Ok((major << 20) | minor)
 }
 
 /// The RPC poll loop. Ask, print, repeat. Ctrl-C to stop.
@@ -76,8 +95,9 @@ async fn poll(rpc_url: String, vote: Option<String>, interval: u64) -> Result<()
     }
 }
 
-/// Load + attach the eBPF tracepoint program, stream its logs.
-async fn watch() -> Result<()> {
+/// The profiler: load the eBPF program, attach both block tracepoints, stream
+/// DiskEvents off the ringbuf.
+async fn watch(dev: Option<String>) -> Result<()> {
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
@@ -89,39 +109,54 @@ async fn watch() -> Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+    // The eBPF object file is embedded at compile time. The volume filter is a
+    // global in that object, patched before load — the kernel never sees other
+    // devices' events at all.
+    let target_dev = match &dev {
+        Some(s) => parse_dev(s)?,
+        None => 0, // accept all
+    };
+    let mut loader = aya::EbpfLoader::new();
+    loader.override_global("TARGET_DEV", &target_dev, true);
+    let mut ebpf = loader.load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/driftwatch"
     )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
-            // This can happen if you remove all log statements from your eBPF program.
-            warn!("failed to initialize eBPF logger: {e}");
-        }
-        Ok(logger) => {
-            let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        // Expected: the kernel program has no log statements.
+        debug!("no eBPF logger: {e}");
+    }
+
+    // Attach both hooks: issue stamps the stopwatch, complete emits the event.
+    for name in ["block_rq_issue", "block_rq_complete"] {
+        let program: &mut TracePoint = ebpf
+            .program_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("program {name} not found in object"))?
+            .try_into()?;
+        program.load()?;
+        program.attach("block", name)?;
+    }
+
+    let events = aya::maps::RingBuf::try_from(
+        ebpf.take_map("EVENTS")
+            .ok_or_else(|| anyhow::anyhow!("EVENTS map not found"))?,
+    )?;
+    let drops = aya::maps::PerCpuArray::try_from(
+        ebpf.take_map("DROPS")
+            .ok_or_else(|| anyhow::anyhow!("DROPS map not found"))?,
+    )?;
+    tokio::spawn(disk::watch_drops(drops));
+
+    match &dev {
+        Some(d) => println!("driftwatch — profiling block device {d} (Ctrl-C to stop)\n"),
+        None => println!("driftwatch — profiling ALL block devices (Ctrl-C to stop)\n"),
+    }
+
+    tokio::select! {
+        res = disk::consume(events) => res,
+        _ = signal::ctrl_c() => {
+            println!("\nstopping.");
+            Ok(())
         }
     }
-    let program: &mut TracePoint = ebpf.program_mut("driftwatch").unwrap().try_into()?;
-    program.load()?;
-    program.attach("block", "block_rq_issue")?;
-
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
-
-    Ok(())
 }
