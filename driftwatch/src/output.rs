@@ -1,5 +1,4 @@
-// Turn a ValidatorSample into a human-readable status line.
-// Later this grows a JSON-per-window emitter and the drift alert.
+// Turn validator samples into readable status lines.
 
 use crate::rpc::{Sample, ValidatorSample};
 
@@ -54,7 +53,7 @@ fn up_line(s: &ValidatorSample) -> String {
     )
 }
 
-/// Thousands separators, no external crate. Comma before every group of 3 from the right.
+/// 1234567 -> "1,234,567"
 fn commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();

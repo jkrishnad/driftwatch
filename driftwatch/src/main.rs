@@ -28,34 +28,31 @@ enum Cmd {
         /// Validator JSON-RPC endpoint.
         #[arg(long, default_value = "http://127.0.0.1:8899")]
         rpc: String,
-        /// Vote account pubkey to track (auto-discovered on test-validator).
+        /// Vote account pubkey (auto-discovered on test-validator).
         #[arg(long)]
         vote: Option<String>,
         /// Seconds between polls.
         #[arg(long, default_value_t = 2)]
         interval: u64,
     },
-    /// Run the eBPF disk-latency profiler (block_rq_issue -> block_rq_complete).
-    /// Linux only, needs root.
+    /// Disk profiler: windowed latency summaries. Linux only, needs root.
     Watch {
-        /// Only trace this block device, as "major:minor" (e.g. 259:0 — find
-        /// yours with `lsblk`). Default: all devices.
+        /// Block device as "major:minor" (find it with lsblk). Default: all.
         #[arg(long)]
         dev: Option<String>,
-        /// Seconds per summary window.
+        /// Seconds per window.
         #[arg(long, default_value_t = 3)]
         window: u64,
-        /// Also print every raw event (debug firehose).
+        /// Also print every raw event.
         #[arg(long)]
         raw: bool,
     },
-    /// The joined tool: disk profiler + RPC poller in one process, one timeline.
-    /// One combined line (or JSON object) per disk window.
+    /// Profiler + poller together: one combined line (or JSON) per window.
     Run {
-        /// Block device to trace, "major:minor" (the ledger volume).
+        /// Block device as "major:minor" (the ledger volume).
         #[arg(long)]
         dev: Option<String>,
-        /// Seconds per window (the timeline heartbeat).
+        /// Seconds per window.
         #[arg(long, default_value_t = 3)]
         window: u64,
         /// Validator JSON-RPC endpoint.
@@ -94,8 +91,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// "259:0" -> kernel dev_t encoding (major << 20 | minor), same as the
-/// tracepoint's dev field.
+/// Turn "259:0" into the single number the kernel uses for that device.
 fn parse_dev(s: &str) -> Result<u32> {
     let (major, minor) = s
         .split_once(':')
@@ -119,8 +115,7 @@ async fn poll(rpc_url: String, vote: Option<String>, interval: u64) -> Result<()
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Never fails: an unreachable RPC arrives as a DOWN sample,
-                // same stream as OK ones — outages are data, not stderr noise.
+                // a failed poll becomes a DOWN sample, not an error
                 let sample = poller.sample().await;
                 println!("{}", output::status_line(&sample));
             }
@@ -132,8 +127,8 @@ async fn poll(rpc_url: String, vote: Option<String>, interval: u64) -> Result<()
     }
 }
 
-/// Live eBPF handle + the two maps the daemon reads. Keep the Ebpf alive —
-/// dropping it detaches the programs.
+/// Live eBPF handle + the two maps the daemon reads.
+/// Keep the Ebpf alive: dropping it detaches the programs.
 type Profiler = (
     aya::Ebpf,
     aya::maps::RingBuf<aya::maps::MapData>,
@@ -142,8 +137,7 @@ type Profiler = (
 
 /// Load the eBPF object, patch the device filter, attach both block tracepoints.
 fn load_profiler(dev: &Option<String>) -> Result<Profiler> {
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
+    // raise the locked-memory limit so the kernel lets us create eBPF maps
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -153,9 +147,7 @@ fn load_profiler(dev: &Option<String>) -> Result<Profiler> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // The eBPF object file is embedded at compile time. The volume filter is a
-    // global in that object, patched before load — the kernel never sees other
-    // devices' events at all.
+    // patch the volume filter into the embedded object before load
     let target_dev = match dev {
         Some(s) => parse_dev(s)?,
         None => 0, // accept all
@@ -167,11 +159,11 @@ fn load_profiler(dev: &Option<String>) -> Result<Profiler> {
         "/driftwatch"
     )))?;
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        // Expected: the kernel program has no log statements.
+        // expected: kernel program has no log statements
         debug!("no eBPF logger: {e}");
     }
 
-    // Attach both hooks: issue stamps the stopwatch, complete emits the event.
+    // attach both hooks: issue starts the stopwatch, complete emits the event
     for name in ["block_rq_issue", "block_rq_complete"] {
         let program: &mut TracePoint = ebpf
             .program_mut(name)
@@ -192,7 +184,7 @@ fn load_profiler(dev: &Option<String>) -> Result<Profiler> {
     Ok((ebpf, events, drops))
 }
 
-/// The profiler alone: windowed disk summaries to stdout.
+/// The profiler alone logs windowed disk summaries
 async fn watch(dev: Option<String>, window: u64, raw: bool) -> Result<()> {
     let (_ebpf, events, drops) = load_profiler(&dev)?;
     tokio::spawn(disk::watch_drops(drops));
@@ -217,7 +209,7 @@ async fn watch(dev: Option<String>, window: u64, raw: bool) -> Result<()> {
             Ok(())
         }
     }
-    // _ebpf drops here -> programs detach, kernel side fully unloads.
+    // dropping _ebpf detaches the programs
 }
 
 /// The joined tool: profiler + poller, one timeline, one line per window.

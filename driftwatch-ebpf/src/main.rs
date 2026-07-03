@@ -22,28 +22,25 @@ const NR_SECTOR_OFF: usize = 24;
 const ERROR_OFF: usize = 28; // complete only
 const RWBS_OFF: usize = 34;
 
-/// The stopwatch: in-flight requests, issue timestamp keyed by (dev, sector).
-/// LRU so orphaned entries (requeues/merges that never complete) self-evict
-/// instead of filling the map and silently killing inserts.
+/// issue timestamps of in-flight requests, keyed by (dev, sector)
 #[map]
 static INFLIGHT: LruHashMap<DiskKey, u64> = LruHashMap::with_max_entries(10240, 0);
 
-/// The conveyor belt: completed-request events to the daemon.
+/// completed DiskEvents, kernel -> daemon
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-/// The honesty counter: events lost because the ringbuf was full.
+/// count of events dropped when the ringbuf was full
 #[map]
 static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
-/// Volume filter, set by the daemon before load (kernel dev_t of the ledger
-/// volume). 0 = accept all devices (dev/test mode).
+/// device to trace, set by the daemon before load. 0 = all
 #[unsafe(no_mangle)]
 static TARGET_DEV: u32 = 0;
 
 #[inline(always)]
 fn target_dev() -> u32 {
-    // volatile: stop the compiler const-folding the pre-load placeholder value.
+    // read at runtime, not compile time (the daemon overwrites this value)
     unsafe { core::ptr::read_volatile(&TARGET_DEV) }
 }
 
@@ -57,7 +54,7 @@ fn try_issue(ctx: &TracePointContext) -> Result<(), i64> {
     let dev: u32 = unsafe { ctx.read_at(DEV_OFF)? };
     let target = target_dev();
     if target != 0 && dev != target {
-        return Ok(()); // not the ledger volume — filter in-kernel, earliest exit
+        return Ok(()); // not our device
     }
     let sector: u64 = unsafe { ctx.read_at(SECTOR_OFF)? };
     let key = DiskKey {
@@ -87,7 +84,7 @@ fn try_complete(ctx: &TracePointContext) -> Result<(), i64> {
         dev: dev as u64,
     };
 
-    // No stashed issue (loaded mid-flight, or LRU evicted it) — skip, don't guess.
+    // no stored issue time: skip
     let Some(issue_ns) = (unsafe { INFLIGHT.get(&key) }) else {
         return Ok(());
     };
@@ -98,8 +95,7 @@ fn try_complete(ctx: &TracePointContext) -> Result<(), i64> {
     let nr_sector: u32 = unsafe { ctx.read_at(NR_SECTOR_OFF)? };
     let error: i32 = unsafe { ctx.read_at(ERROR_OFF)? };
 
-    // rwbs is a flag string ("R", "WS", "FWS", ...). Op char isn't always first
-    // (preflush 'F' can lead), so scan for R/W.
+    // rwbs = flag string like "WS"; find R or W
     let rwbs: [u8; 10] = unsafe { ctx.read_at(RWBS_OFF)? };
     let mut rw = RW_OTHER;
     for b in rwbs {
@@ -133,7 +129,7 @@ fn try_complete(ctx: &TracePointContext) -> Result<(), i64> {
             entry.submit(0);
         }
         None => {
-            // Ringbuf full: count the loss so the daemon knows its numbers lie.
+            // ringbuf full: count the drop
             if let Some(drops) = DROPS.get_ptr_mut(0) {
                 unsafe { *drops += 1 };
             }

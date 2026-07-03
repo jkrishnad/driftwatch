@@ -1,13 +1,3 @@
-// The validator-layer signal — the context feed for the disk profiler.
-// Polls the validator's JSON-RPC and produces a ValidatorSample each tick.
-//
-// Design notes:
-// - Raw JSON-RPC over reqwest + serde_json. No solana-client crate (huge dep
-//   tree, version-sensitive). These 3 methods are stable across Agave versions.
-// - vote_lag = network tip slot - my vote account's lastVote.
-//   On solana-test-validator this is ~0 (no cluster to lag behind); it becomes
-//   meaningful on a real node. Code is identical either way; only the URL changes.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -25,8 +15,7 @@ pub async fn poll_stream(mut poller: RpcPoller, interval_secs: u64, tx: Sender<S
     }
 }
 
-/// One poll's worth of validator-layer signal. Handed to the correlator later;
-/// for now we just print it.
+/// One poll's worth of validator-layer signal.
 #[derive(Debug, Clone)]
 pub struct ValidatorSample {
     pub epoch: u64,
@@ -38,10 +27,8 @@ pub struct ValidatorSample {
     pub healthy: bool,     // getHealth == "ok"
 }
 
-/// What one poll tick yields. An unreachable RPC is not an error to hide on
-/// stderr — it's the strongest validator-layer signal there is (process down,
-/// credits bleeding now). Modeling it as a sample puts outages on the same
-/// timeline the correlator reads.
+/// One poll tick. An unreachable RPC is a Down SAMPLE, not an error:
+/// outages belong on the same timeline the correlator reads.
 #[derive(Debug, Clone)]
 pub enum Sample {
     Up(ValidatorSample),
@@ -52,8 +39,7 @@ pub enum Sample {
 pub struct RpcPoller {
     url: String,
     client: reqwest::Client,
-    // The vote account we track. On solana-test-validator we auto-discover the
-    // single built-in vote account. On a real node you'd pass your own pubkey.
+    // vote account to track; auto-discovered when not set
     vote_pubkey: Option<String>,
 }
 
@@ -95,7 +81,7 @@ impl RpcPoller {
             .ok_or_else(|| anyhow!("{method}: no result field"))
     }
 
-    /// One tick, never fails: RPC trouble becomes a Down sample, not an error.
+    /// One tick; errors become a Down sample.
     pub async fn sample(&mut self) -> Sample {
         match self.poll().await {
             Ok(s) => Sample::Up(s),
@@ -106,7 +92,7 @@ impl RpcPoller {
     }
 
     async fn poll(&mut self) -> Result<ValidatorSample> {
-        // getHealth returns "ok" or an rpc error; error body = unhealthy, not fatal.
+        // getHealth: "ok" or an rpc error body
         let healthy = matches!(
             self.call("getHealth", json!([])).await,
             Ok(Value::String(s)) if s == "ok"
@@ -118,14 +104,14 @@ impl RpcPoller {
             .as_u64()
             .context("absoluteSlot")?;
 
-        // If we know our vote pubkey, filter server-side (cheap on real nodes).
+        // filter server-side when we know the pubkey
         let params = match &self.vote_pubkey {
             Some(pk) => json!([{ "votePubkey": pk }]),
             None => json!([]),
         };
         let vote_accounts = self.call("getVoteAccounts", params).await?;
 
-        // Search current first, then delinquent — we still want numbers while down.
+        // check current first, then delinquent
         let (acct, delinquent) = ["current", "delinquent"]
             .iter()
             .find_map(|set| {
@@ -138,7 +124,7 @@ impl RpcPoller {
             })
             .ok_or_else(|| anyhow!("vote account not found in getVoteAccounts"))?;
 
-        // Remember the discovered pubkey so later polls filter server-side.
+        // cache the discovered pubkey
         if self.vote_pubkey.is_none() {
             if let Some(pk) = acct["votePubkey"].as_str() {
                 self.vote_pubkey = Some(pk.to_string());
@@ -147,8 +133,7 @@ impl RpcPoller {
 
         let my_last_vote = acct["lastVote"].as_u64().context("lastVote")?;
 
-        // epochCredits: [[epoch, cumulative, prev_cumulative], ...]
-        // this-epoch credits = cumulative - prev_cumulative of the last entry.
+        // epochCredits entry: [epoch, cumulative, prev]; this epoch = cum - prev
         let credits = acct["epochCredits"]
             .as_array()
             .and_then(|entries| entries.last())

@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::Result;
 use aya::maps::{MapData, PerCpuArray, RingBuf};
 use driftwatch_common::{DiskEvent, RW_READ, RW_WRITE};
-use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc::Sender;
+use tokio::{io::unix::AsyncFd, sync::mpsc::Sender};
 
-/// Two wake sources: kernel says "data ready" -> drain into the window;
-/// ticker fires -> finish the window, send its stats, start fresh.
+/// Two wake sources: kernel when "data ready" -> drain into the window;
+/// ticker fires to finish the window, send its stats, and start fresh.
 pub async fn consume(
     ring: RingBuf<MapData>,
     window_secs: u64,
@@ -49,7 +48,7 @@ pub async fn consume(
     }
 }
 
-/// One finished window, numbers precomputed — ready for printing or correlating.
+/// One finished window, numbers precomputed.
 #[derive(Debug, Clone)]
 pub struct WindowStats {
     pub window_secs: u64,
@@ -88,9 +87,9 @@ pub fn format_stats(s: &WindowStats) -> String {
         s.writes,
         s.reads,
         s.others,
-        latency(s.p50_ns),
-        latency(s.p99_ns),
-        latency(s.max_ns),
+        human_latency(s.p50_ns),
+        human_latency(s.p99_ns),
+        human_latency(s.max_ns),
     )
 }
 
@@ -108,7 +107,7 @@ pub fn compact_stats(s: &WindowStats) -> String {
     };
     format!(
         "disk p99 {} | {} reqs | {mbps:.1} MB/s{err}",
-        latency(s.p99_ns),
+        human_latency(s.p99_ns),
         s.reqs
     )
 }
@@ -169,13 +168,13 @@ impl Window {
     }
 }
 
-/// Ringbuf bytes -> DiskEvent. Safe: both sides compile the same
-/// #[repr(C)] struct from driftwatch-common.
+/// Turn raw ringbuf bytes into a DiskEvent (kernel and daemon share the
+/// same struct layout, so this is safe).
 fn read_event(item: &[u8]) -> DiskEvent {
     unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) }
 }
 
-/// Warn when the kernel's drop counter grows (ringbuf overflowed = stats lied).
+/// Warn when the kernel's drop counter grows (events were lost).
 pub async fn watch_drops(drops: PerCpuArray<MapData, u64>) {
     let mut last: u64 = 0;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -213,11 +212,11 @@ fn format_event(ev: &DiskEvent) -> String {
     format!(
         "disk {major}:{minor} {rw} {} {}{err}",
         size(ev.bytes),
-        latency(ev.latency_ns),
+        human_latency(ev.latency_ns),
     )
 }
 
-fn latency(ns: u64) -> String {
+pub fn human_latency(ns: u64) -> String {
     if ns >= 1_000_000 {
         format!("{:.1}ms", ns as f64 / 1e6)
     } else {
