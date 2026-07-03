@@ -3,10 +3,12 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-// Lima VM "ebpf" — port is dynamic (changes on restart), so we use Lima's own
-// ssh.config file which Lima keeps up-to-date automatically.
-const SSH_CONFIG: &str = "/Users/jayakrishna/.lima/ebpf/ssh.config";
-const SSH_HOST: &str = "lima-ebpf";
+// Lima VM "client-run" — the box where the test validator runs, so driftwatch
+// builds and runs beside it (mirrors production: daemon on the validator box).
+// Port is dynamic (changes on restart), so we use Lima's own ssh.config file
+// which Lima keeps up-to-date automatically.
+const SSH_CONFIG: &str = "/Users/jayakrishna/.lima/client-run/ssh.config";
+const SSH_HOST: &str = "lima-client-run";
 const LOCAL_DIR: &str = "/Users/jayakrishna/Documents/svm/driftwatch";
 // Mac home is mounted read-only inside the VM, so we sync to the VM's own
 // writable home directory instead of building in-place.
