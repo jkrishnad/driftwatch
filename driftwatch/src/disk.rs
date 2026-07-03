@@ -1,4 +1,5 @@
-// Consume DiskEvents off the kernel ringbuf, print one summary line per window.
+// Consume DiskEvents off the kernel ringbuf, emit one WindowStats per window.
+// The caller decides what to do with them (print, or feed the correlator).
 // --raw also prints every event.
 
 use std::time::Duration;
@@ -7,10 +8,16 @@ use anyhow::Result;
 use aya::maps::{MapData, PerCpuArray, RingBuf};
 use driftwatch_common::{DiskEvent, RW_READ, RW_WRITE};
 use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc::Sender;
 
 /// Two wake sources: kernel says "data ready" -> drain into the window;
-/// ticker fires -> print summary, start fresh window.
-pub async fn consume(ring: RingBuf<MapData>, window_secs: u64, raw: bool) -> Result<()> {
+/// ticker fires -> finish the window, send its stats, start fresh.
+pub async fn consume(
+    ring: RingBuf<MapData>,
+    window_secs: u64,
+    raw: bool,
+    tx: Sender<WindowStats>,
+) -> Result<()> {
     let mut ring_fd = AsyncFd::with_interest(ring, tokio::io::Interest::READABLE)?;
     let mut window = Window::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(window_secs));
@@ -33,11 +40,77 @@ pub async fn consume(ring: RingBuf<MapData>, window_secs: u64, raw: bool) -> Res
                 guard.clear_ready();
             }
             _ = ticker.tick() => {
-                println!("{}", window.summary(window_secs));
-                window = Window::default();
+                let stats = std::mem::take(&mut window).finish(window_secs);
+                if tx.send(stats).await.is_err() {
+                    return Ok(()); // receiver gone -> we're shutting down
+                }
             }
         }
     }
+}
+
+/// One finished window, numbers precomputed — ready for printing or correlating.
+#[derive(Debug, Clone)]
+pub struct WindowStats {
+    pub window_secs: u64,
+    pub reqs: usize,
+    pub writes: u64,
+    pub reads: u64,
+    pub others: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    pub dev: Option<u32>,
+    pub p50_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
+}
+
+/// Full line for `watch`:
+/// disk 253:16 | 5s | 81 reqs (81W/0R/0O) | p50 62µs | p99 4.2ms | max 4.2ms | 1.2 MB/s
+pub fn format_stats(s: &WindowStats) -> String {
+    let dev = match s.dev {
+        Some(d) => format!("{}:{}", d >> 20, d & ((1 << 20) - 1)),
+        None => String::new(),
+    };
+    if s.reqs == 0 {
+        return format!("disk {dev} | {}s | idle", s.window_secs);
+    }
+    let mbps = s.bytes as f64 / (1024.0 * 1024.0) / s.window_secs as f64;
+    let err = if s.errors > 0 {
+        format!(" | ERRORS {}", s.errors)
+    } else {
+        String::new()
+    };
+    format!(
+        "disk {dev} | {}s | {} reqs ({}W/{}R/{}O) | p50 {} | p99 {} | max {} | {mbps:.1} MB/s{err}",
+        s.window_secs,
+        s.reqs,
+        s.writes,
+        s.reads,
+        s.others,
+        latency(s.p50_ns),
+        latency(s.p99_ns),
+        latency(s.max_ns),
+    )
+}
+
+/// Short form for the combined timeline:
+/// disk p99 4.2ms | 81 reqs | 1.2 MB/s      (or "disk idle")
+pub fn compact_stats(s: &WindowStats) -> String {
+    if s.reqs == 0 {
+        return "disk idle".into();
+    }
+    let mbps = s.bytes as f64 / (1024.0 * 1024.0) / s.window_secs as f64;
+    let err = if s.errors > 0 {
+        format!(" | ERR {}", s.errors)
+    } else {
+        String::new()
+    };
+    format!(
+        "disk p99 {} | {} reqs | {mbps:.1} MB/s{err}",
+        latency(s.p99_ns),
+        s.reqs
+    )
 }
 
 /// Events accumulated over one window.
@@ -67,39 +140,32 @@ impl Window {
         self.dev.get_or_insert(ev.dev);
     }
 
-    /// e.g: disk 253:16 | 5s | 81 reqs (81W/0R/0O) | p50 62µs | p99 4.2ms | max 4.2ms | 1.2 MB/s
-    fn summary(&mut self, window_secs: u64) -> String {
+    /// Close the window: sort once, take percentiles at 50% / 99%.
+    fn finish(mut self, window_secs: u64) -> WindowStats {
         let n = self.latencies_ns.len();
-        let dev = match self.dev {
-            Some(d) => format!("{}:{}", d >> 20, d & ((1 << 20) - 1)),
-            None => String::new(),
-        };
-        if n == 0 {
-            return format!("disk {dev} | {window_secs}s | idle");
-        }
-
-        // percentiles = sort, index at 50% / 99%
-        self.latencies_ns.sort_unstable();
-        let p50 = self.latencies_ns[n / 2];
-        let p99 = self.latencies_ns[(n * 99 / 100).min(n - 1)];
-        let max = self.latencies_ns[n - 1];
-
-        let mbps = self.bytes as f64 / (1024.0 * 1024.0) / window_secs as f64;
-        let err = if self.errors > 0 {
-            format!(" | ERRORS {}", self.errors)
+        let (p50, p99, max) = if n == 0 {
+            (0, 0, 0)
         } else {
-            String::new()
+            self.latencies_ns.sort_unstable();
+            (
+                self.latencies_ns[n / 2],
+                self.latencies_ns[(n * 99 / 100).min(n - 1)],
+                self.latencies_ns[n - 1],
+            )
         };
-
-        format!(
-            "disk {dev} | {window_secs}s | {n} reqs ({}W/{}R/{}O) | p50 {} | p99 {} | max {} | {mbps:.1} MB/s{err}",
-            self.writes,
-            self.reads,
-            self.others,
-            latency(p50),
-            latency(p99),
-            latency(max),
-        )
+        WindowStats {
+            window_secs,
+            reqs: n,
+            writes: self.writes,
+            reads: self.reads,
+            others: self.others,
+            bytes: self.bytes,
+            errors: self.errors,
+            dev: self.dev,
+            p50_ns: p50,
+            p99_ns: p99,
+            max_ns: max,
+        }
     }
 }
 

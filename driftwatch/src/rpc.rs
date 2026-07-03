@@ -12,6 +12,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::Sender;
+
+/// Poll forever, sending each Sample down the channel (for the correlator).
+pub async fn poll_stream(mut poller: RpcPoller, interval_secs: u64, tx: Sender<Sample>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    loop {
+        ticker.tick().await;
+        if tx.send(poller.sample().await).await.is_err() {
+            return; // receiver gone -> shutting down
+        }
+    }
+}
 
 /// One poll's worth of validator-layer signal. Handed to the correlator later;
 /// for now we just print it.
